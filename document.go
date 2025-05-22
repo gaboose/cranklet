@@ -30,9 +30,17 @@ type Document struct {
 	db          *sql.DB
 }
 
-func NewDocument(name string) (*Document, error) {
-	db, err := ensureDB(name + ".sqlite3")
+func NewDocument(path string) (*Document, error) {
+	db, err := sql.Open("sqlite3", path)
 	if err != nil {
+		return nil, err
+	}
+
+	if _, err := db.Exec(verticesTable); err != nil {
+		return nil, err
+	}
+
+	if _, err := db.Exec(edgesTable); err != nil {
 		return nil, err
 	}
 
@@ -129,21 +137,4 @@ func (d *Document) Subscribe(handler *func(Vertex) bool) {
 
 func (d *Document) Unsubscribe(handler *func(Vertex) bool) {
 	delete(d.subscribers, handler)
-}
-
-func ensureDB(path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", path)
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := db.Exec(verticesTable); err != nil {
-		return nil, err
-	}
-
-	if _, err := db.Exec(edgesTable); err != nil {
-		return nil, err
-	}
-
-	return db, nil
 }

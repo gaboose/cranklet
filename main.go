@@ -2,9 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -24,14 +29,68 @@ type SharedDocument struct {
 
 type Server struct {
 	documents *SharedDocuments
+	db        *DB
 }
 
-func NewServer() *Server {
+func NewServer() (*Server, error) {
+	db, err := NewDB(path.Join(*data, "db.sqlite3"))
+	if err != nil {
+		return nil, err
+	}
+
 	return &Server{
 		documents: &SharedDocuments{
 			inner: make(map[string]*SharedDocument),
 		},
+		db: db,
+	}, nil
+}
+
+func (s *Server) document(name string) (*SharedDocument, error) {
+	filename, err := s.db.DocumentFilename(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get document path: %w", err)
 	}
+
+	s.documents.mu.Lock()
+	doc, ok := s.documents.inner[name]
+	if !ok {
+		doc = &SharedDocument{inner: nil}
+		s.documents.inner[name] = doc
+
+		// Release s.documents.mu quickly, but hold on to doc.mu while we restore over
+		// network.
+		doc.mu.Lock()
+		defer doc.mu.Unlock()
+		s.documents.mu.Unlock()
+
+		if len(*restore) > 0 {
+			cmd := exec.Command("sh", "-c", *restore+" "+*data+" "+filename)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return nil, fmt.Errorf("failed to restore document: %w", err)
+			}
+		}
+
+		if len(*replicate) > 0 {
+			cmd := exec.Command("sh", "-c", *replicate+" "+*data+" "+filename)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			go cmd.Run()
+		}
+
+		innerDoc, err := NewDocument(path.Join(*data, filename))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create document: %w", err)
+		}
+
+		doc.inner = innerDoc
+	} else {
+		s.documents.mu.Unlock()
+	}
+
+	return doc, nil
 }
 
 var upgrader = websocket.Upgrader{
@@ -39,24 +98,6 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize: 1024,
 	// Allow all origins for testing (consider restricting in production)
 	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
-func (s *Server) document(name string) (*SharedDocument, error) {
-	s.documents.mu.Lock()
-	defer s.documents.mu.Unlock()
-
-	doc, ok := s.documents.inner[name]
-	if !ok {
-		innerDoc, err := NewDocument(name)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create document: %w", err)
-		}
-
-		doc = &SharedDocument{inner: innerDoc}
-		s.documents.inner[name] = doc
-	}
-
-	return doc, nil
 }
 
 func (s *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
@@ -179,8 +220,41 @@ func (s *Server) readHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
+var (
+	data      = flag.String("data", "./data", "Data directory")
+	restore   = flag.String("restore", "", "Restore command")
+	replicate = flag.String("replicate", "", "Replicate command")
+)
+
 func main() {
-	s := NewServer()
+	flag.Parse()
+
+	var err error
+	*data, err = filepath.Abs(*data)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if len(*restore) > 0 {
+		cmd := exec.Command("sh", "-c", *restore+" "+*data+" "+"db.sqlite3")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	if len(*replicate) > 0 {
+		cmd := exec.Command("sh", "-c", *replicate+" "+*data+" "+"db.sqlite3")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		go cmd.Run()
+	}
+
+	s, err := NewServer()
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if websocket.IsWebSocketUpgrade(r) {
