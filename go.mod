@@ -1,4 +1,4 @@
-module github.com/cranklet
+module github.com/gaboose/cranklet
 
 go 1.22.3
 
